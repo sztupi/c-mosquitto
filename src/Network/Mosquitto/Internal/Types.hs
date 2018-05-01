@@ -12,6 +12,7 @@ import           Language.C.Inline.TypeLevel
 import qualified Language.C.Types as C
 import qualified Language.C.Inline.Context as C
 import           Data.ByteString (ByteString)
+import           Control.Monad.Trans.Control
 
 import qualified Data.Map as M
 import           Foreign.Storable
@@ -50,27 +51,27 @@ mosquittoTypesTable = M.fromList
    , ( C.TypeName "bool"              , [t| Bool |] )
    ]
 
-type OnMessage = Message -> IO ()
+type OnMessage m = MonadBaseControl IO m => Message -> m ()
 type COnMessage = Ptr C'Mosquitto -> Ptr () -> Ptr C'Message -> IO ()
 foreign import ccall "wrapper"
   mkCOnMessage :: COnMessage -> IO (FunPtr COnMessage)
 
-type OnLog = Int -> String -> IO ()
+type OnLog m = MonadBaseControl IO m => Int -> String -> m ()
 type COnLog = Ptr C'Mosquitto ->  Ptr () -> CInt -> Ptr CChar -> IO ()
 foreign import ccall "wrapper"
   mkCOnLog :: COnLog -> IO (FunPtr COnLog)
 
-type OnConnection = Int -> IO ()
+type OnConnection m = MonadBaseControl IO m => Int -> m ()
 type COnConnection = Ptr C'Mosquitto ->  Ptr () -> CInt -> IO ()
 foreign import ccall "wrapper"
   mkCOnConnection :: COnConnection -> IO (FunPtr COnConnection)
 
-type OnSubscribe = Int -> [Int] -> IO ()
+type OnSubscribe m = MonadBaseControl IO m => Int -> [Int] -> m ()
 type COnSubscribe = Ptr C'Mosquitto ->  Ptr () -> CInt -> CInt -> Ptr CInt -> IO ()
 foreign import ccall "wrapper"
   mkCOnSubscribe :: COnSubscribe -> IO (FunPtr COnSubscribe)
 
-type OnPublish = Int -> IO ()
+type OnPublish m = MonadBaseControl IO m => Int -> m ()
 type COnPublish = Ptr C'Mosquitto -> Ptr () -> CInt -> IO ()
 foreign import ccall "wrapper"
   mkCOnPublish :: COnPublish -> IO (FunPtr COnPublish)

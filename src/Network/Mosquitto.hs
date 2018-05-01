@@ -12,6 +12,8 @@ module Network.Mosquitto
 where
 
 import           Control.Monad
+import           Control.Monad.Base
+import           Control.Monad.Trans.Control
 import           Data.Char (chr)
 import           Data.Coerce (coerce)
 import           Data.Monoid ((<>))
@@ -59,8 +61,8 @@ init = [C.exp| int{ mosquitto_lib_init() }|]
 {-# NOINLINE cleanup #-}
 cleanup = [C.exp| int{ mosquitto_lib_cleanup() }|]
 
-withMosquittoLibrary :: IO a -> IO a
-withMosquittoLibrary f = Network.Mosquitto.init *> f <* cleanup
+withMosquittoLibrary :: MonadBase IO m => m a -> m a
+withMosquittoLibrary f = (liftBase Network.Mosquitto.init) *> f <* (liftBase cleanup)
 
 {-# NOINLINE version #-}
 version :: (Int, Int, Int)
@@ -73,8 +75,10 @@ version = unsafePerformIO $
  where
    peek' x = fromIntegral <$> peek x
 
-newMosquitto :: Bool -> String -> Maybe a -> IO (Mosquitto a)
-newMosquitto clearSession (nullTermStr -> userId) _userData = do
+newMosquitto
+  :: MonadBase IO m
+  => Bool -> String -> Maybe a -> m (Mosquitto a)
+newMosquitto clearSession (nullTermStr -> userId) _userData = liftBase $ do
    fp <- newForeignPtr_ <$> [C.block|struct mosquitto *{
         struct mosquitto * p =
           mosquitto_new( $bs-ptr:userId
@@ -87,14 +91,19 @@ newMosquitto clearSession (nullTermStr -> userId) _userData = do
 
    Mosquitto <$> fp
 
-destroyMosquitto :: Mosquitto a -> IO ()
-destroyMosquitto ms = withPtr ms $ \ptr ->
+destroyMosquitto
+  :: MonadBase IO m
+  => Mosquitto a
+  -> m ()
+destroyMosquitto ms = liftBase $ withPtr ms $ \ptr ->
    [C.exp|void{
          mosquitto_destroy($(struct mosquitto *ptr))
      }|]
 
-setTls :: Mosquitto a -> String -> Maybe (String, String) -> IO ()
-setTls mosq (nullTermStr -> caFile) userCert =
+setTls
+  :: MonadBase IO m
+  => Mosquitto a -> String -> Maybe (String, String) -> m ()
+setTls mosq (nullTermStr -> caFile) userCert = liftBase $
   withPtr mosq $ \pMosq -> do
     (certFile, keyFile) <- case userCert of
       Just (nullTermStr -> certFile, nullTermStr -> keyFile) ->
@@ -113,12 +122,13 @@ setTls mosq (nullTermStr -> caFile) userCert =
     }|]
 
 setReconnectDelay
-  :: Mosquitto a -- ^ mosquitto instance
+  :: MonadBase IO m
+  => Mosquitto a -- ^ mosquitto instance
   -> Bool        -- ^ exponential backoff
   -> Int         -- ^ initial backoff
   -> Int         -- ^ maximum backoff
-  -> IO Int
-setReconnectDelay mosq  exponential (fromIntegral -> reconnectDelay) (fromIntegral -> reconnectDelayMax) =
+  -> m Int
+setReconnectDelay mosq  exponential (fromIntegral -> reconnectDelay) (fromIntegral -> reconnectDelayMax) = liftBase $ 
   fmap fromIntegral <$> withPtr mosq $ \pMosq ->
        [C.exp|int{
              mosquitto_reconnect_delay_set
@@ -130,10 +140,11 @@ setReconnectDelay mosq  exponential (fromIntegral -> reconnectDelay) (fromIntegr
         }|]
 
 setUsernamePassword
-  :: Mosquitto a
+  :: MonadBase IO m
+  => Mosquitto a
   -> Maybe (String,String)
-  -> IO Int
-setUsernamePassword mosq mUserPwd =
+  -> m Int
+setUsernamePassword mosq mUserPwd = liftBase $
   fmap fromIntegral <$> withPtr mosq $ \pMosq ->
     case mUserPwd of
       Just (nullTermStr -> user, nullTermStr -> pwd) ->
@@ -153,8 +164,10 @@ setUsernamePassword mosq mUserPwd =
                   )
         }|]
 
-connect :: Mosquitto a -> String -> Int -> Int -> IO Int
-connect mosq (nullTermStr -> hostname) (fromIntegral -> port) (fromIntegral -> keepAlive) =
+connect
+  :: MonadBase IO m
+  => Mosquitto a -> String -> Int -> Int -> m Int
+connect mosq (nullTermStr -> hostname) (fromIntegral -> port) (fromIntegral -> keepAlive) = liftBase $
   fmap fromIntegral <$> withPtr mosq $ \pMosq ->
        [C.exp|int{
                mosquitto_connect( $(struct mosquitto *pMosq)
@@ -164,55 +177,76 @@ connect mosq (nullTermStr -> hostname) (fromIntegral -> port) (fromIntegral -> k
                                 )
              }|]
 
-onSubscribe :: Mosquitto a -> OnSubscribe -> IO ()
-onSubscribe mosq onSubscribe =  do
-  on_subscribe <- mkCOnSubscribe $ \_ _ mid (fromIntegral -> ii) iis ->
-      onSubscribe (fromIntegral mid) =<< mapM (fmap fromIntegral . peekElemOff iis) [0..ii-1]
-  withPtr mosq $ \pMosq ->
-     [C.block|void{
-        mosquitto_subscribe_callback_set
-            ( $(struct mosquitto *pMosq)
-            , $(void (*on_subscribe)(struct mosquitto *,void *, int, int, const int *))
-            );
-       }|]
+onSubscribe
+  :: ( MonadBaseControl IO m
+     , StM m () ~ () )
+  => Mosquitto a -> OnSubscribe m -> m ()
+onSubscribe mosq onSubscribeF =
+  liftBaseWith $ \runInBase -> do
+    on_subscribe <- mkCOnSubscribe $ \_ _ mid (fromIntegral -> ii) iis -> do
+      args <- mapM (fmap fromIntegral . peekElemOff iis) [0..ii-1]
+      runInBase $ onSubscribeF (fromIntegral mid) args
+    withPtr mosq $ \pMosq ->
+      [C.block|void{
+          mosquitto_subscribe_callback_set
+              ( $(struct mosquitto *pMosq)
+              , $(void (*on_subscribe)(struct mosquitto *,void *, int, int, const int *))
+              );
+        }|]
 
 
-onConnect :: Mosquitto a -> OnConnection -> IO ()
-onConnect mosq onConnect =  do
-  on_connect <- mkCOnConnection $ \_ _ ii -> onConnect (fromIntegral ii)
-  withPtr mosq $ \pMosq ->
-     [C.block|void{
-        mosquitto_connect_callback_set
-            ( $(struct mosquitto *pMosq)
-            , $(void (*on_connect)(struct mosquitto *,void *, int))
-            );
-       }|]
+onConnect
+  :: ( MonadBaseControl IO m
+     , StM m () ~ () )
+  => Mosquitto a -> OnConnection m -> m ()
+onConnect mosq onConnect =
+  liftBaseWith $ \runInBase -> do
+    on_connect <- mkCOnConnection $ \_ _ ii -> runInBase $ onConnect (fromIntegral ii)
+    withPtr mosq $ \pMosq ->
+      [C.block|void{
+          mosquitto_connect_callback_set
+              ( $(struct mosquitto *pMosq)
+              , $(void (*on_connect)(struct mosquitto *,void *, int))
+              );
+        }|]
 
-onDisconnect :: Mosquitto a -> OnConnection -> IO ()
-onDisconnect mosq onDisconnect =  do
-  on_disconnect <- mkCOnConnection $ \_ _ ii -> onDisconnect (fromIntegral ii)
-  withPtr mosq $ \pMosq ->
-     [C.block|void{
-        mosquitto_disconnect_callback_set
-            ( $(struct mosquitto *pMosq)
-            , $(void (*on_disconnect)(struct mosquitto *,void *, int))
-            );
-       }|]
+onDisconnect
+  :: ( MonadBaseControl IO m
+     , StM m () ~ () )
+  => Mosquitto a -> OnConnection m -> m ()
+onDisconnect mosq onDisconnect =
+  liftBaseWith $ \runInBase -> do
+    on_disconnect <- mkCOnConnection $ \_ _ ii -> runInBase $ onDisconnect (fromIntegral ii)
+    withPtr mosq $ \pMosq ->
+      [C.block|void{
+          mosquitto_disconnect_callback_set
+              ( $(struct mosquitto *pMosq)
+              , $(void (*on_disconnect)(struct mosquitto *,void *, int))
+              );
+        }|]
 
-onLog :: Mosquitto a -> OnLog -> IO ()
-onLog mosq onLog =  do
-  on_log <- mkCOnLog $ \_ _ ii mm -> onLog (fromIntegral ii) =<< peekCString mm
-  withPtr mosq $ \pMosq ->
-     [C.block|void{
-        mosquitto_log_callback_set
-            ( $(struct mosquitto *pMosq)
-            , $(void (*on_log)(struct mosquitto *,void *, int, const char *))
-            );
-       }|]
+onLog
+  :: ( MonadBaseControl IO m
+     , StM m () ~ () )
+  => Mosquitto a -> OnLog m -> m ()
+onLog mosq onLog =
+  liftBaseWith $ \runInBase -> do
+    on_log <- mkCOnLog $ \_ _ ii mm -> runInBase (onLog (fromIntegral ii) =<< liftBase (peekCString mm))
+    withPtr mosq $ \pMosq ->
+      [C.block|void{
+          mosquitto_log_callback_set
+              ( $(struct mosquitto *pMosq)
+              , $(void (*on_log)(struct mosquitto *,void *, int, const char *))
+              );
+        }|]
 
-onMessage :: Mosquitto a -> OnMessage -> IO ()
-onMessage mosq onMessage =  do
-    on_message <- mkCOnMessage $ \_ _ mm -> (onMessage =<< c'MessageToMMessage mm)
+onMessage
+  :: ( MonadBaseControl IO m
+     , StM m () ~ () )
+  => Mosquitto a -> OnMessage m -> m ()
+onMessage mosq onMessage =
+  liftBaseWith $ \runInBase -> do
+    on_message <- mkCOnMessage $ \_ _ mm -> runInBase (onMessage =<< liftBase (c'MessageToMMessage mm))
     withPtr mosq $ \pMosq ->
      [C.block|void{
         mosquitto_message_callback_set
@@ -221,40 +255,44 @@ onMessage mosq onMessage =  do
             );
        }|]
 
-onPublish :: Mosquitto a -> OnPublish -> IO ()
-onPublish mosq onPublish =  do
-  on_publish <- mkCOnPublish $ \_ _ mid -> onPublish (fromIntegral mid)
-  withPtr mosq $ \pMosq ->
-     [C.block|void{
-        mosquitto_publish_callback_set
-            ( $(struct mosquitto *pMosq)
-            , $(void (*on_publish)(struct mosquitto *,void *, int))
-            );
-       }|]
+onPublish
+  :: ( MonadBaseControl IO m
+     , StM m () ~ () )
+  => Mosquitto a -> OnPublish m -> m ()
+onPublish mosq onPublish =
+  liftBaseWith $ \runInBase -> do
+    on_publish <- mkCOnPublish $ \_ _ mid -> runInBase $ onPublish (fromIntegral mid)
+    withPtr mosq $ \pMosq ->
+      [C.block|void{
+          mosquitto_publish_callback_set
+              ( $(struct mosquitto *pMosq)
+              , $(void (*on_publish)(struct mosquitto *,void *, int))
+              );
+        }|]
 
-loop :: Mosquitto a -> IO ()
-loop mosq =
+loop :: MonadBase IO m => Mosquitto a -> m ()
+loop mosq = liftBase $
   withPtr mosq $ \pMosq ->
     [C.exp|void{
              mosquitto_loop($(struct mosquitto *pMosq), -1, 1)
         }|]
 
-loopForever :: Mosquitto a -> IO ()
-loopForever mosq =
+loopForever :: MonadBase IO m => Mosquitto a -> m ()
+loopForever mosq = liftBase $
   withPtr mosq $ \pMosq ->
        [C.exp|void{
              mosquitto_loop_forever($(struct mosquitto *pMosq), -1, 1)
         }|]
 
-setTlsInsecure :: Mosquitto a -> Bool -> IO ()
-setTlsInsecure mosq isInsecure =
+setTlsInsecure :: MonadBase IO m => Mosquitto a -> Bool -> m ()
+setTlsInsecure mosq isInsecure = liftBase $
   withPtr mosq $ \pMosq ->
        [C.exp|void{
              mosquitto_tls_insecure_set($(struct mosquitto *pMosq), $(bool isInsecure))
         }|]
 
-setWill :: Mosquitto a -> Bool -> Int -> String -> S.ByteString -> IO Int
-setWill mosq retain (fromIntegral -> qos) (nullTermStr -> topic) payload =
+setWill :: MonadBase IO m => Mosquitto a -> Bool -> Int -> String -> S.ByteString -> m Int
+setWill mosq retain (fromIntegral -> qos) (nullTermStr -> topic) payload = liftBase $
   fmap fromIntegral <$> withPtr mosq $ \pMosq ->
        [C.exp|int{
              mosquitto_will_set
@@ -267,14 +305,15 @@ setWill mosq retain (fromIntegral -> qos) (nullTermStr -> topic) payload =
                )
         }|]
 
-clearWill :: Mosquitto a -> IO Int
-clearWill mosq = fmap fromIntegral <$> withPtr mosq $ \pMosq ->
-       [C.exp|int{
+clearWill :: MonadBase IO m => Mosquitto a -> m Int
+clearWill mosq = liftBase $
+  fmap fromIntegral <$> withPtr mosq $ \pMosq ->
+        [C.exp|int{
              mosquitto_will_clear($(struct mosquitto *pMosq))
         }|]
 
-publish :: Mosquitto a -> Bool -> Int -> String -> S.ByteString -> IO ()
-publish mosq retain (fromIntegral -> qos) (nullTermStr -> topic) payload =
+publish :: MonadBase IO m => Mosquitto a -> Bool -> Int -> String -> S.ByteString -> m ()
+publish mosq retain (fromIntegral -> qos) (nullTermStr -> topic) payload = liftBase $
   withPtr mosq $ \pMosq ->
        [C.exp|void{
              mosquitto_publish
@@ -288,8 +327,8 @@ publish mosq retain (fromIntegral -> qos) (nullTermStr -> topic) payload =
                )
         }|]
 
-subscribe :: Mosquitto a -> Int -> String -> IO ()
-subscribe mosq (fromIntegral -> qos) (nullTermStr -> topic) =
+subscribe :: MonadBase IO m => Mosquitto a -> Int -> String -> m ()
+subscribe mosq (fromIntegral -> qos) (nullTermStr -> topic) = liftBase $
   withPtr mosq $ \pMosq ->
        [C.exp|void{
              mosquitto_subscribe
@@ -300,8 +339,8 @@ subscribe mosq (fromIntegral -> qos) (nullTermStr -> topic) =
                )
         }|]
 
-strerror :: Int -> IO String
-strerror (fromIntegral -> errno) = do
+strerror :: MonadBase IO m => Int -> m String
+strerror (fromIntegral -> errno) = liftBase $ do
   cstr <- [C.exp|const char*{
               mosquitto_strerror( $(int errno)  )
             }|]
